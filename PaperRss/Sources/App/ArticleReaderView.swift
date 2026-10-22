@@ -105,6 +105,8 @@ struct ArticleReaderView: View {
     var isReaderCollapsed = false
     var isZenMode: Bool = false
     var onToggleZenMode: () -> Void = {}
+    /// 阅读器确定正文和段落编号后交给导出。译文覆盖检查必须用这一份，不能另切 HTML。
+    var onReaderTranslationSource: (String, ReaderTranslationSource) -> Void = { _, _ in }
     @State private var translationDocumentReady = false
     @State private var preparedArticle: PreparedArticle?
     @State private var displayedEntry: Entry?
@@ -443,20 +445,21 @@ struct ArticleReaderView: View {
             guard !Task.isCancelled, activeLoadEntryID == requestedEntry.id else { return }
             ArticleSwitchTrace.mark("article prepared", entryID: requestedEntry.id)
 
-            let loadedText = prepared.text.isEmpty ? requestedEntry.sourceText : prepared.text
-            let sourceHTML = prepared.html
             let articleTitle = requestedEntry.title
-            let (loadedHTML, parsedParagraphs) = await Task.detached(priority: .userInitiated) { () -> (String, [ReaderParagraph]) in
-                let html: String
-                if sourceHTML.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty, !loadedText.isEmpty {
-                    html = "<p>\(loadedText.htmlEscaped.replacingOccurrences(of: "\n", with: "<br>"))</p>"
-                } else {
-                    html = sourceHTML
-                }
-                let loadedHTML = ArticleExtractor.removingDuplicateLeadingHeading(from: html, articleTitle: articleTitle) ?? ""
-                guard !loadedHTML.isEmpty else { return (loadedHTML, []) }
-                return (loadedHTML, ArticleExtractor.readerParagraphs(in: loadedHTML, title: articleTitle))
+            let articleText = prepared.text
+            let articleHTML = prepared.html
+            let fallbackText = requestedEntry.sourceText
+            let translationSource = await Task.detached(priority: .userInitiated) {
+                ReaderTranslationSource.make(
+                    articleText: articleText,
+                    articleHTML: articleHTML,
+                    title: articleTitle,
+                    fallbackText: fallbackText
+                )
             }.value
+            let loadedText = translationSource.text
+            let loadedHTML = translationSource.html
+            let parsedParagraphs = translationSource.paragraphs
             guard !Task.isCancelled, activeLoadEntryID == requestedEntry.id else { return }
             ArticleSwitchTrace.mark("content indexed", entryID: requestedEntry.id)
 
@@ -473,6 +476,7 @@ struct ArticleReaderView: View {
             parsedReaderParagraphs = parsedParagraphs
             parsedReaderEntryID = requestedEntry.id
             translationDocumentReady = true
+            onReaderTranslationSource(requestedEntry.id, translationSource)
             if store.llmConfiguration.showsAISummary,
                store.llmConfiguration.automaticallyGenerateSummary,
                store.artifact(for: requestedEntry, kind: .summary) == nil,
@@ -7845,6 +7849,9 @@ struct ReaderCapsuleToolbar: View {
     var canOpenOriginal: Bool = false
     var openOriginalKeyHint: String = ""
     var onOpenOriginal: () -> Void = {}
+    var canExportOriginalMarkdown: Bool = false
+    var canExportTranslatedMarkdown: Bool = false
+    var onExportMarkdown: (ArticleMarkdownExportKind) -> Void = { _ in }
 
     @Environment(\.colorScheme) private var colorScheme
     @Environment(\.paperAppearancePalette) private var appearancePalette
@@ -7908,6 +7915,38 @@ struct ReaderCapsuleToolbar: View {
             .buttonStyle(.plain)
             .disabled(!canOpenOriginal)
             .accessibilityLabel(openOriginalAccessibilityLabel)
+
+            Menu {
+                Button(I18N.shared.localized("下载原文 Markdown", "Download original Markdown")) {
+                    onExportMarkdown(.original)
+                }
+                .disabled(!canExportOriginalMarkdown)
+
+                Button(I18N.shared.localized("下载译文 Markdown", "Download translated Markdown")) {
+                    onExportMarkdown(.translation)
+                }
+                .disabled(!canExportTranslatedMarkdown)
+
+                Button(I18N.shared.localized("下载对照 Markdown", "Download comparison Markdown")) {
+                    onExportMarkdown(.comparison)
+                }
+                .disabled(!canExportTranslatedMarkdown)
+
+                if !canExportTranslatedMarkdown {
+                    Divider()
+                    Text(I18N.shared.localized("译文和对照需等全文翻译完成", "Translation and comparison need a finished article translation"))
+                }
+            } label: {
+                toolbarSymbol("square.and.arrow.down", isActive: false)
+            }
+            #if os(macOS)
+            .menuStyle(.borderlessButton)
+            #endif
+            .menuIndicator(.hidden)
+            .buttonStyle(.plain)
+            .fixedSize()
+            .disabled(disabled || !canExportOriginalMarkdown)
+            .accessibilityLabel(I18N.localized("下载 Markdown"))
         }
         .padding(.horizontal, 6)
         .frame(height: 28)

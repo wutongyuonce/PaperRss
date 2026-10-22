@@ -274,6 +274,9 @@ struct RootView: View {
     @State private var showsSettings = false
     @State private var showsImporter = false
     @State private var showsExporter = false
+    @State private var readerExportEntryID: String?
+    @State private var readerExportSource: ReaderTranslationSource?
+    @State private var markdownExport: MarkdownExportDraft?
     @State private var isZenMode = false
     @AppStorage("timeline_view_style") private var timelineStyleRaw = TimelineViewStyle.list.rawValue
     @AppStorage("timeline_image_preference") private var timelineImagePreferenceRaw = TimelineImagePreference.enabled.rawValue
@@ -384,6 +387,22 @@ struct RootView: View {
                 Task { await store.importOPML(data) }
             }
             .fileExporter(isPresented: $showsExporter, document: OPMLExportDocument(data: store.exportOPML()), contentType: .xml, defaultFilename: "PaperRss-Subscriptions") { _ in }
+            .fileExporter(
+                isPresented: Binding(
+                    get: { markdownExport != nil },
+                    set: { if !$0 { markdownExport = nil } }
+                ),
+                document: MarkdownExportDocument(text: markdownExport?.markdown ?? ""),
+                contentType: .articleMarkdown,
+                defaultFilename: markdownExport?.filenameStem ?? "article"
+            ) { result in
+                if case .failure = result {
+                    showToast(
+                        I18N.shared.localized("Markdown 没有保存", "The Markdown file was not saved"),
+                        icon: "exclamationmark.triangle.fill"
+                    )
+                }
+            }
             .alert("PaperRss", isPresented: Binding(get: { store.lastError != nil }, set: { if !$0 { store.dismissError() } })) {
                 Button(I18N.localized("好"), role: .cancel) { store.dismissError() }
             } message: { Text(store.lastError ?? "") }
@@ -1243,8 +1262,16 @@ struct RootView: View {
                     showsMagazineReturn: timelineStyle == .magazine,
                     isReaderCollapsed: timelineStyle != .list && isTimelineBrowsing && !isZenMode,
                     isZenMode: isZenMode,
-                    onToggleZenMode: { withAnimation { isZenMode.toggle() } }
+                    onToggleZenMode: { withAnimation { isZenMode.toggle() } },
+                    onReaderTranslationSource: { entryID, source in
+                        readerExportEntryID = entryID
+                        readerExportSource = source
+                    }
                 )
+                .onChange(of: selectedEntry.id) { _, _ in
+                    readerExportEntryID = nil
+                    readerExportSource = nil
+                }
                 .environment(\.colorScheme, appearanceColorScheme)
                 .ignoresSafeArea()
             } else {
@@ -1285,30 +1312,19 @@ struct RootView: View {
     private var readerToolbarCapsule: some View {
         if let selectedEntry {
             let current = store.entry(id: selectedEntry.id) ?? selectedEntry
-            ReaderCapsuleToolbar(
-                isBilingualActive: store.isBilingualActive(for: current.id),
-                isRead: current.isRead,
-                isStarred: current.isStarred,
+            ReaderMarkdownCapsule(
+                store: store,
+                workspace: store.aiWorkspace,
+                entry: current,
                 isZenMode: isZenMode,
-                disabled: false,
-                onToggleBilingual: {
-                    store.toggleBilingualMode(for: current.id)
-                },
-                onToggleRead: {
-                    store.markRead(current, read: !current.isRead)
-                },
-                onToggleStar: {
-                    store.toggleStar(current)
-                },
-                onToggleZenMode: {
-                    withAnimation {
-                        isZenMode.toggle()
-                    }
-                },
-                canOpenOriginal: current.url != nil,
+                readerSource: readerExportEntryID == current.id ? readerExportSource : nil,
                 openOriginalKeyHint: readerShortcutKeyLabel(.openOriginal),
-                onOpenOriginal: {
-                    openOriginalArticle(current)
+                onToggleZenMode: {
+                    withAnimation { isZenMode.toggle() }
+                },
+                onOpenOriginal: { openOriginalArticle(current) },
+                onExportMarkdown: { kind in
+                    beginMarkdownExport(kind, entry: current)
                 }
             )
             .environment(\.colorScheme, appearanceColorScheme)
@@ -1331,6 +1347,87 @@ struct RootView: View {
         .environment(\.colorScheme, appearanceColorScheme)
         .environment(\.paperAppearancePalette, store.readerAppearance.palette(for: appearanceMode))
         .ignoresSafeArea()
+    }
+
+    private func beginMarkdownExport(_ kind: ArticleMarkdownExportKind, entry: Entry) {
+        let input = ReaderMarkdownExportInput.make(
+            store: store,
+            workspace: store.aiWorkspace,
+            entry: entry,
+            readerSource: readerExportEntryID == entry.id ? readerExportSource : nil
+        )
+        guard let document = ArticleMarkdownExport.document(for: input, kind: kind) else {
+            let message = kind == .original
+                ? I18N.shared.localized("这篇文章还没有可以导出的正文", "This article has no content to export")
+                : I18N.shared.localized("译文和对照需等全文翻译完成", "Translation and comparison need a finished article translation")
+            showToast(message, icon: "exclamationmark.triangle.fill")
+            return
+        }
+        markdownExport = MarkdownExportDraft(filenameStem: document.filenameStem, markdown: document.markdown)
+    }
+}
+
+private enum ReaderMarkdownExportInput {
+    static func make(
+        store: AppStore,
+        workspace: ArticleAIWorkspace,
+        entry: Entry,
+        readerSource: ReaderTranslationSource?
+    ) -> ArticleMarkdownExportInput {
+        let segments = readerSource.flatMap { store.bilingualArtifact(for: entry, text: $0.text)?.segments } ?? []
+        let inFlight = workspace.isWorking(entryID: entry.id, kind: .bilingual)
+            || store.isGeneratingAI(for: entry, kind: .bilingual)
+        return ArticleMarkdownExportInput(
+            title: entry.title,
+            author: entry.author,
+            feedTitle: store.feed(for: entry)?.title,
+            publishedAt: entry.publishedAt,
+            canonicalURL: entry.url,
+            readerSource: readerSource,
+            feedHTML: entry.contentHTML,
+            fallbackText: entry.sourceText,
+            segments: segments,
+            translationInFlight: inFlight
+        )
+    }
+}
+
+private struct ReaderMarkdownCapsule: View {
+    @ObservedObject var store: AppStore
+    @ObservedObject var workspace: ArticleAIWorkspace
+    let entry: Entry
+    let isZenMode: Bool
+    let readerSource: ReaderTranslationSource?
+    let openOriginalKeyHint: String
+    let onToggleZenMode: () -> Void
+    let onOpenOriginal: () -> Void
+    let onExportMarkdown: (ArticleMarkdownExportKind) -> Void
+
+    var body: some View {
+        let current = store.entry(id: entry.id) ?? entry
+        let availability = ArticleMarkdownExport.availability(for: ReaderMarkdownExportInput.make(
+            store: store,
+            workspace: workspace,
+            entry: current,
+            readerSource: readerSource
+        ))
+        ReaderCapsuleToolbar(
+            isBilingualActive: store.isBilingualActive(for: current.id),
+            isRead: current.isRead,
+            isStarred: current.isStarred,
+            isZenMode: isZenMode,
+            disabled: false,
+            onToggleBilingual: { store.toggleBilingualMode(for: current.id) },
+            onToggleRead: { store.markRead(current, read: !current.isRead) },
+            onToggleStar: { store.toggleStar(current) },
+            onToggleZenMode: onToggleZenMode,
+            canOpenOriginal: current.url != nil,
+            openOriginalKeyHint: openOriginalKeyHint,
+            onOpenOriginal: onOpenOriginal,
+            canExportOriginalMarkdown: availability.canExportOriginal,
+            canExportTranslatedMarkdown: availability.canExportTranslated,
+            onExportMarkdown: onExportMarkdown
+        )
     }
 }
 
@@ -4137,6 +4234,31 @@ private struct AddFeedSheet: View {
 extension UTType {
     static var opml: UTType {
         UTType(importedAs: "public.opml", conformingTo: .xml)
+    }
+
+    static var articleMarkdown: UTType {
+        UTType(filenameExtension: "md") ?? .plainText
+    }
+}
+
+private struct MarkdownExportDraft {
+    var filenameStem: String
+    var markdown: String
+}
+
+private struct MarkdownExportDocument: FileDocument {
+    static var readableContentTypes: [UTType] { [.articleMarkdown, .plainText] }
+    var text: String
+
+    init(text: String) { self.text = text }
+
+    init(configuration: ReadConfiguration) throws {
+        let data = configuration.file.regularFileContents ?? Data()
+        text = String(data: data, encoding: .utf8) ?? ""
+    }
+
+    func fileWrapper(configuration: WriteConfiguration) throws -> FileWrapper {
+        FileWrapper(regularFileWithContents: Data(text.utf8))
     }
 }
 

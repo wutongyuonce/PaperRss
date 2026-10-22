@@ -66,6 +66,21 @@ final class MacOS14ZenModeToolbarContractTests: XCTestCase {
         XCTAssertTrue(rootSource.contains("private func openOriginalArticle("), "按钮与快捷键必须共用同一动作入口")
     }
 
+    func testReaderCapsuleToolbarExportsMarkdownAfterTranslationCompletes() throws {
+        let readerSource = try appSource("ArticleReaderView.swift")
+        let rootSource = try appSource("RootView.swift")
+        let toolbarStart = try XCTUnwrap(readerSource.range(of: "struct ReaderCapsuleToolbar: View"))
+        let toolbarSource = readerSource[toolbarStart.lowerBound..<readerSource.endIndex]
+
+        XCTAssertTrue(toolbarSource.contains("toolbarSymbol(\"square.and.arrow.down\""), "阅读胶囊必须提供下载入口")
+        XCTAssertTrue(toolbarSource.contains("下载原文 Markdown"))
+        XCTAssertTrue(toolbarSource.contains("下载译文 Markdown"))
+        XCTAssertTrue(toolbarSource.contains("下载对照 Markdown"))
+        XCTAssertTrue(toolbarSource.contains(".disabled(!canExportTranslatedMarkdown)"), "译文未完成时译文和对照必须不可选")
+        XCTAssertTrue(rootSource.contains("ArticleMarkdownExport.document"), "保存前必须经过导出判定，不能由按钮自行拼正文")
+        XCTAssertTrue(readerSource.contains("ReaderTranslationSource.make"), "导出用的段落必须和阅读器翻译用的是同一份")
+    }
+
     func testContextMenuExposesShareLinkAndCopyLink() throws {
         let rootSource = try appSource("RootView.swift")
         let contextMenuStart = try XCTUnwrap(rootSource.range(of: "private func entryContextMenu("))
